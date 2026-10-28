@@ -1,0 +1,893 @@
+--[[ 
+    VyreHub - Auto Joiner v3.0
+    Modes : VIEWER (liste en direct + Join) / SCANNER (scanne et envoie au feed)
+]]
+
+if getgenv().VyreHubLoaded then
+    warn("[VyreHub] Déjà chargé.")
+    return
+end
+getgenv().VyreHubLoaded = true
+
+-- Services
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Configuration
+local Config = {
+    Targets = "Egg,Pet",       -- noms à chercher / filtrer, séparés par des virgules
+    MaxPlayers = 6,            -- (scanner) serveurs avec au plus X joueurs
+    ScanDelay = 4,             -- (scanner) secondes avant le scan
+    StopOnFind = false,        -- (scanner) s'arrête quand un pet est trouvé
+    FeedURL = "",              -- URL de ton backend, ex: https://monserveur.onrender.com
+    Key = "change-me",         -- même clé que sur le backend
+    Mode = "viewer",           -- "viewer" ou "scanner"
+    AutoJoin = false,          -- (viewer) rejoint automatiquement le nouveau pet
+    Running = false,
+}
+
+-- Optionnel : URL de ton script hébergé pour la relance après téléportation
+-- (inutile si tu mets le script dans le dossier autoexec de ton exécuteur)
+local ScriptURL = ""
+
+-- Hôtes utilisés pour lister les serveurs en mode scanner (le 2e sert de secours)
+local HOSTS = { "games.roblox.com", "games.roproxy.com" }
+
+local FILE = "VyreHub_data.json"
+local State = { found = {}, visited = {} }
+State.visited[game.JobId] = true
+
+-- Sauvegarde / chargement
+local function saveState()
+    if not writefile then return end
+    pcall(function()
+        writefile(FILE, HttpService:JSONEncode({
+            found = State.found,
+            visited = State.visited,
+            running = Config.Running,
+            config = {
+                Targets = Config.Targets,
+                MaxPlayers = Config.MaxPlayers,
+                ScanDelay = Config.ScanDelay,
+                StopOnFind = Config.StopOnFind,
+                FeedURL = Config.FeedURL,
+                Key = Config.Key,
+                Mode = Config.Mode,
+                AutoJoin = Config.AutoJoin,
+            },
+        }))
+    end)
+end
+
+local resumeRun = false
+local function loadState()
+    if not (readfile and isfile) then return end
+    local ok, data = pcall(function()
+        if isfile(FILE) then
+            return HttpService:JSONDecode(readfile(FILE))
+        end
+    end)
+    if ok and type(data) == "table" then
+        if type(data.found) == "table" then State.found = data.found end
+        if type(data.visited) == "table" then State.visited = data.visited end
+        State.visited[game.JobId] = true
+        if type(data.config) == "table" then
+            local c = data.config
+            Config.Targets = c.Targets or Config.Targets
+            Config.MaxPlayers = c.MaxPlayers or Config.MaxPlayers
+            Config.ScanDelay = c.ScanDelay or Config.ScanDelay
+            if c.StopOnFind ~= nil then Config.StopOnFind = c.StopOnFind end
+            Config.FeedURL = c.FeedURL or Config.FeedURL
+            Config.Key = c.Key or Config.Key
+            if c.Mode == "viewer" or c.Mode == "scanner" then Config.Mode = c.Mode end
+            if c.AutoJoin ~= nil then Config.AutoJoin = c.AutoJoin end
+        end
+        resumeRun = data.running == true
+    end
+end
+loadState()
+
+-- Requête HTTP compatible : retourne (corps, code HTTP)
+local function httpRequest(method, url, body)
+    local req = (syn and syn.request) or http_request or request
+    if req then
+        local ok, res = pcall(req, {
+            Url = url,
+            Method = method,
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body,
+        })
+        if ok and res then
+            return res.Body, res.StatusCode
+        end
+    end
+    if method == "GET" then
+        local ok, b = pcall(function() return game:HttpGet(url) end)
+        if ok and b then return b, 200 end
+    end
+    return nil, nil
+end
+
+local function httpGet(url)
+    return httpRequest("GET", url)
+end
+
+-- Liste des mots-clés
+local function getTargets()
+    local list = {}
+    for word in string.gmatch(Config.Targets, "[^,]+") do
+        word = word:gsub("^%s+", ""):gsub("%s+$", "")
+        if word ~= "" then table.insert(list, string.lower(word)) end
+    end
+    return list
+end
+
+-- Scan du serveur actuel : retourne une table {nom = quantité}
+local function scanServer()
+    local targets = getTargets()
+    local found = {}
+    local total = 0
+    if #targets == 0 then return found, total end
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") or obj:IsA("BasePart") then
+            local lname = string.lower(obj.Name)
+            for _, t in ipairs(targets) do
+                if string.find(lname, t, 1, true) then
+                    local owner = Players:GetPlayerFromCharacter(obj)
+                    local inChar = false
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p.Character and obj:IsDescendantOf(p.Character) then
+                            inChar = true
+                            break
+                        end
+                    end
+                    if not owner and not inChar then
+                        found[obj.Name] = (found[obj.Name] or 0) + 1
+                        total = total + 1
+                    end
+                    break
+                end
+            end
+        end
+    end
+    return found, total
+end
+
+-- Recherche d'un serveur : retourne (jobId) ou (nil, raison)
+local function findServer()
+    local lastErr = nil
+    local sawAnyServer = false
+    local fallback = nil
+
+    for _, host in ipairs(HOSTS) do
+        local cursor = ""
+        for _ = 1, 5 do
+            local url = ("https://%s/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s")
+                :format(host, game.PlaceId, cursor ~= "" and ("&cursor=" .. cursor) or "")
+            local body, code = httpGet(url)
+
+            if not body then
+                lastErr = "HTTP bloqué (" .. host .. ")"
+                break
+            end
+            if code == 429 then
+                lastErr = "limite 429 (" .. host .. ")"
+                break
+            end
+            if code and code ~= 200 then
+                lastErr = "HTTP " .. tostring(code) .. " (" .. host .. ")"
+                break
+            end
+
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if not ok or type(data) ~= "table" or type(data.data) ~= "table" then
+                lastErr = "réponse invalide (" .. host .. ")"
+                break
+            end
+
+            for _, server in ipairs(data.data) do
+                if server.id and server.id ~= game.JobId
+                    and server.playing and server.maxPlayers
+                    and server.playing < server.maxPlayers then
+                    sawAnyServer = true
+                    if not State.visited[server.id] then
+                        if server.playing <= Config.MaxPlayers then
+                            return server.id
+                        end
+                        if not fallback then fallback = server.id end
+                    end
+                end
+            end
+
+            if data.nextPageCursor then
+                cursor = data.nextPageCursor
+            else
+                break
+            end
+        end
+
+        if fallback then return fallback end
+    end
+
+    if fallback then return fallback end
+
+    if sawAnyServer then
+        State.visited = {}
+        State.visited[game.JobId] = true
+        saveState()
+        return nil, "tous visités, réinitialisation"
+    end
+
+    return nil, lastErr or "aucun serveur disponible"
+end
+
+-- ========================= GUI =========================
+local COL = {
+    bg = Color3.fromRGB(15, 15, 22),
+    side = Color3.fromRGB(21, 21, 31),
+    card = Color3.fromRGB(28, 28, 41),
+    accent = Color3.fromRGB(130, 80, 255),
+    accentDark = Color3.fromRGB(95, 55, 200),
+    text = Color3.fromRGB(235, 235, 245),
+    sub = Color3.fromRGB(150, 150, 170),
+    green = Color3.fromRGB(90, 220, 130),
+    red = Color3.fromRGB(230, 70, 90),
+    yellow = Color3.fromRGB(255, 210, 110),
+}
+
+local parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "VyreHub"
+gui.ResetOnSpawn = false
+gui.Parent = parent
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 500, 0, 330)
+main.Position = UDim2.new(0.5, -250, 0.5, -165)
+main.BackgroundColor3 = COL.bg
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = COL.accent
+mainStroke.Thickness = 1.5
+
+-- Barre de titre
+local topbar = Instance.new("Frame")
+topbar.Size = UDim2.new(1, 0, 0, 38)
+topbar.BackgroundColor3 = COL.side
+topbar.BorderSizePixel = 0
+topbar.Parent = main
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(0, 260, 1, 0)
+title.Position = UDim2.new(0, 14, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "🥚 VyreHub  |  Auto Joiner"
+title.TextColor3 = COL.text
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = topbar
+
+local function topButton(text, xOffset, color)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 26, 0, 24)
+    b.Position = UDim2.new(1, xOffset, 0.5, -12)
+    b.BackgroundColor3 = color
+    b.Text = text
+    b.TextColor3 = COL.text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.BorderSizePixel = 0
+    b.Parent = topbar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local closeBtn = topButton("X", -34, COL.red)
+local minBtn = topButton("-", -66, COL.card)
+
+-- Barre latérale
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 116, 1, -38)
+sidebar.Position = UDim2.new(0, 0, 0, 38)
+sidebar.BackgroundColor3 = COL.side
+sidebar.BorderSizePixel = 0
+sidebar.Parent = main
+
+local sideLayout = Instance.new("UIListLayout", sidebar)
+sideLayout.Padding = UDim.new(0, 6)
+local sidePad = Instance.new("UIPadding", sidebar)
+sidePad.PaddingTop = UDim.new(0, 10)
+sidePad.PaddingLeft = UDim.new(0, 8)
+sidePad.PaddingRight = UDim.new(0, 8)
+
+-- Zone de contenu
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -124, 1, -46)
+content.Position = UDim2.new(0, 120, 0, 42)
+content.BackgroundTransparency = 1
+content.Parent = main
+
+local pages = {}
+local tabButtons = {}
+
+local function newPage(name)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 1, 0)
+    f.BackgroundTransparency = 1
+    f.Visible = false
+    f.Parent = content
+    pages[name] = f
+    return f
+end
+
+local function showPage(name)
+    for n, p in pairs(pages) do p.Visible = (n == name) end
+    for n, b in pairs(tabButtons) do
+        b.BackgroundColor3 = (n == name) and COL.accent or COL.card
+    end
+end
+
+local function newTab(name, label)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, 0, 0, 32)
+    b.BackgroundColor3 = COL.card
+    b.Text = label
+    b.TextColor3 = COL.text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 13
+    b.BorderSizePixel = 0
+    b.Parent = sidebar
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    tabButtons[name] = b
+    b.MouseButton1Click:Connect(function() showPage(name) end)
+end
+
+newTab("joiner", "🔍  Joiner")
+newTab("settings", "⚙  Réglages")
+
+local pageJoiner = newPage("joiner")
+local pageSettings = newPage("settings")
+
+-- Statut (bas de la page Joiner)
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 20)
+status.Position = UDim2.new(0, 0, 1, -20)
+status.BackgroundTransparency = 1
+status.Text = "Statut : prêt"
+status.TextColor3 = COL.sub
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Parent = pageJoiner
+
+local function setStatus(text, color)
+    status.Text = "Statut : " .. text
+    status.TextColor3 = color or COL.sub
+end
+
+-- Bouton Démarrer / Arrêter
+local startBtn = Instance.new("TextButton")
+startBtn.Size = UDim2.new(0, 150, 0, 32)
+startBtn.BackgroundColor3 = COL.accent
+startBtn.Text = "▶ Démarrer"
+startBtn.TextColor3 = COL.text
+startBtn.Font = Enum.Font.GothamBold
+startBtn.TextSize = 14
+startBtn.BorderSizePixel = 0
+startBtn.Parent = pageJoiner
+Instance.new("UICorner", startBtn).CornerRadius = UDim.new(0, 8)
+
+local clearBtn = Instance.new("TextButton")
+clearBtn.Size = UDim2.new(0, 100, 0, 32)
+clearBtn.Position = UDim2.new(0, 158, 0, 0)
+clearBtn.BackgroundColor3 = COL.card
+clearBtn.Text = "🗑 Vider"
+clearBtn.TextColor3 = COL.text
+clearBtn.Font = Enum.Font.GothamBold
+clearBtn.TextSize = 13
+clearBtn.BorderSizePixel = 0
+clearBtn.Parent = pageJoiner
+Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 8)
+
+local countLabel = Instance.new("TextLabel")
+countLabel.Size = UDim2.new(0, 110, 0, 32)
+countLabel.Position = UDim2.new(1, -110, 0, 0)
+countLabel.BackgroundTransparency = 1
+countLabel.Text = "0 serveur(s)"
+countLabel.TextColor3 = COL.sub
+countLabel.Font = Enum.Font.Gotham
+countLabel.TextSize = 12
+countLabel.TextXAlignment = Enum.TextXAlignment.Right
+countLabel.Parent = pageJoiner
+
+-- Liste des pets trouvés
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, 0, 1, -62)
+list.Position = UDim2.new(0, 0, 0, 38)
+list.BackgroundColor3 = COL.side
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.ScrollBarImageColor3 = COL.accent
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = pageJoiner
+Instance.new("UICorner", list).CornerRadius = UDim.new(0, 8)
+local listLayout = Instance.new("UIListLayout", list)
+listLayout.Padding = UDim.new(0, 6)
+local listPad = Instance.new("UIPadding", list)
+listPad.PaddingTop = UDim.new(0, 6)
+listPad.PaddingLeft = UDim.new(0, 6)
+listPad.PaddingRight = UDim.new(0, 10)
+listPad.PaddingBottom = UDim.new(0, 6)
+
+local function joinServer(jobId)
+    if jobId == game.JobId then
+        setStatus("tu es déjà dans ce serveur", COL.yellow)
+        return
+    end
+    State.visited[jobId] = true
+    saveState()
+    setStatus("téléportation vers le serveur...", COL.accent)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, LocalPlayer)
+    end)
+    if not ok then
+        warn("[VyreHub] Erreur téléportation : " .. tostring(err))
+        setStatus("échec de la téléportation", COL.red)
+    end
+end
+
+local function renderList()
+    for _, c in ipairs(list:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    countLabel.Text = #State.found .. " serveur(s)"
+
+    for i = #State.found, 1, -1 do
+        local entry = State.found[i]
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, 56)
+        row.BackgroundColor3 = COL.card
+        row.BorderSizePixel = 0
+        row.Parent = list
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+        local names = Instance.new("TextLabel")
+        names.Size = UDim2.new(1, -90, 0, 30)
+        names.Position = UDim2.new(0, 10, 0, 4)
+        names.BackgroundTransparency = 1
+        names.Text = table.concat(entry.pets or {}, ", ")
+        names.TextColor3 = COL.green
+        names.Font = Enum.Font.GothamBold
+        names.TextSize = 13
+        names.TextXAlignment = Enum.TextXAlignment.Left
+        names.TextYAlignment = Enum.TextYAlignment.Top
+        names.TextWrapped = true
+        names.TextTruncate = Enum.TextTruncate.AtEnd
+        names.Parent = row
+
+        local info = Instance.new("TextLabel")
+        info.Size = UDim2.new(1, -90, 0, 16)
+        info.Position = UDim2.new(0, 10, 1, -20)
+        info.BackgroundTransparency = 1
+        info.Text = ("👥 %s  •  %s  •  %s"):format(
+            tostring(entry.players or "?"),
+            string.sub(entry.jobId or "", 1, 8),
+            os.date("%H:%M", entry.time or os.time()))
+        info.TextColor3 = COL.sub
+        info.Font = Enum.Font.Gotham
+        info.TextSize = 11
+        info.TextXAlignment = Enum.TextXAlignment.Left
+        info.Parent = row
+
+        local jb = Instance.new("TextButton")
+        jb.Size = UDim2.new(0, 70, 0, 34)
+        jb.Position = UDim2.new(1, -78, 0.5, -17)
+        jb.BackgroundColor3 = COL.accent
+        jb.Text = "Join"
+        jb.TextColor3 = COL.text
+        jb.Font = Enum.Font.GothamBold
+        jb.TextSize = 13
+        jb.BorderSizePixel = 0
+        jb.Parent = row
+        Instance.new("UICorner", jb).CornerRadius = UDim.new(0, 8)
+        jb.MouseButton1Click:Connect(function() joinServer(entry.jobId) end)
+    end
+end
+
+-- Envoi d'une trouvaille au feed (mode scanner)
+local function reportToFeed(entry)
+    if Config.FeedURL == "" then return end
+    task.spawn(function()
+        local payload = HttpService:JSONEncode({
+            key = Config.Key,
+            jobId = entry.jobId,
+            placeId = game.PlaceId,
+            pets = entry.pets,
+            players = entry.players,
+        })
+        local body, code = httpRequest("POST", Config.FeedURL .. "/report", payload)
+        if not body then
+            warn("[VyreHub] Envoi au feed impossible")
+        elseif code and code ~= 200 then
+            warn("[VyreHub] Feed a répondu HTTP " .. tostring(code) .. " (clé incorrecte ?)")
+        end
+    end)
+end
+
+-- Ajoute / remplace une entrée dans la liste
+local function upsertEntry(entry)
+    for i = #State.found, 1, -1 do
+        if State.found[i].jobId == entry.jobId then
+            table.remove(State.found, i)
+        end
+    end
+    table.insert(State.found, entry)
+    while #State.found > 50 do table.remove(State.found, 1) end
+end
+
+-- Trouvaille locale (mode scanner)
+local function addFound(petsTable)
+    local names = {}
+    for name, qty in pairs(petsTable) do
+        table.insert(names, qty > 1 and (name .. " x" .. qty) or name)
+    end
+    table.sort(names)
+
+    local entry = {
+        pets = names,
+        jobId = game.JobId,
+        players = #Players:GetPlayers() .. "/" .. Players.MaxPlayers,
+        time = os.time(),
+    }
+    upsertEntry(entry)
+    renderList()
+    saveState()
+    reportToFeed(entry)
+end
+
+clearBtn.MouseButton1Click:Connect(function()
+    State.found = {}
+    renderList()
+    saveState()
+end)
+
+-- Page Réglages
+local function makeSetting(labelText, default, y)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0, 140, 0, 26)
+    l.Position = UDim2.new(0, 0, 0, y)
+    l.BackgroundTransparency = 1
+    l.Text = labelText
+    l.TextColor3 = COL.text
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 13
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = pageSettings
+
+    local b = Instance.new("TextBox")
+    b.Size = UDim2.new(1, -150, 0, 26)
+    b.Position = UDim2.new(0, 148, 0, y)
+    b.BackgroundColor3 = COL.card
+    b.Text = tostring(default)
+    b.TextColor3 = COL.text
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 12
+    b.ClearTextOnFocus = false
+    b.BorderSizePixel = 0
+    b.Parent = pageSettings
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local targetsBox = makeSetting("Noms (a,b,c) :", Config.Targets, 0)
+local playersBox = makeSetting("Joueurs max :", Config.MaxPlayers, 30)
+local delayBox = makeSetting("Délai scan (s) :", Config.ScanDelay, 60)
+local feedBox = makeSetting("URL du feed :", Config.FeedURL, 90)
+local keyBox = makeSetting("Clé :", Config.Key, 120)
+
+local function makeToggle(labelText, y, getText, getColor, onClick)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0, 140, 0, 26)
+    l.Position = UDim2.new(0, 0, 0, y)
+    l.BackgroundTransparency = 1
+    l.Text = labelText
+    l.TextColor3 = COL.text
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 13
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = pageSettings
+
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 90, 0, 26)
+    b.Position = UDim2.new(0, 148, 0, y)
+    b.TextColor3 = COL.text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.BorderSizePixel = 0
+    b.Parent = pageSettings
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+
+    local function refresh()
+        b.Text = getText()
+        b.BackgroundColor3 = getColor()
+    end
+    refresh()
+    b.MouseButton1Click:Connect(function()
+        onClick()
+        refresh()
+        saveState()
+    end)
+end
+
+makeToggle("Stop si trouvé :", 150,
+    function() return Config.StopOnFind and "ON" or "OFF" end,
+    function() return Config.StopOnFind and COL.green or COL.red end,
+    function() Config.StopOnFind = not Config.StopOnFind end)
+
+makeToggle("Auto-Join :", 180,
+    function() return Config.AutoJoin and "ON" or "OFF" end,
+    function() return Config.AutoJoin and COL.green or COL.red end,
+    function() Config.AutoJoin = not Config.AutoJoin end)
+
+makeToggle("Mode :", 210,
+    function() return Config.Mode == "viewer" and "VIEWER" or "SCANNER" end,
+    function() return Config.Mode == "viewer" and COL.accent or COL.yellow end,
+    function()
+        if Config.Running then return end
+        Config.Mode = (Config.Mode == "viewer") and "scanner" or "viewer"
+    end)
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, 0, 0, 40)
+hint.Position = UDim2.new(0, 0, 0, 240)
+hint.BackgroundTransparency = 1
+hint.Text = "VIEWER : liste en direct + Join. SCANNER : saute de serveur et envoie les pets au feed. Arrête avant de changer de mode."
+hint.TextColor3 = COL.sub
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 11
+hint.TextWrapped = true
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.TextYAlignment = Enum.TextYAlignment.Top
+hint.Parent = pageSettings
+
+local function applySettings()
+    Config.Targets = targetsBox.Text
+    Config.MaxPlayers = tonumber(playersBox.Text) or Config.MaxPlayers
+    Config.ScanDelay = tonumber(delayBox.Text) or Config.ScanDelay
+    local u = feedBox.Text:gsub("%s+", "")
+    u = u:gsub("/+$", "")
+    Config.FeedURL = u
+    Config.Key = keyBox.Text
+    saveState()
+end
+targetsBox.FocusLost:Connect(applySettings)
+playersBox.FocusLost:Connect(applySettings)
+delayBox.FocusLost:Connect(applySettings)
+feedBox.FocusLost:Connect(applySettings)
+keyBox.FocusLost:Connect(applySettings)
+
+-- Déplacement du GUI
+do
+    local dragging, dragStart, startPos
+    topbar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- Minimiser / fermer
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    TweenService:Create(main, TweenInfo.new(0.2), {
+        Size = minimized and UDim2.new(0, 500, 0, 38) or UDim2.new(0, 500, 0, 330)
+    }):Play()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    Config.Running = false
+    saveState()
+    gui:Destroy()
+    getgenv().VyreHubLoaded = nil
+end)
+
+-- ===================== Boucles principales =====================
+local function setRunningUI(running)
+    startBtn.Text = running and "■ Arrêter" or "▶ Démarrer"
+    startBtn.BackgroundColor3 = running and COL.red or COL.accent
+end
+
+-- MODE SCANNER : saute de serveur en serveur, scanne, envoie au feed
+local function scannerLoop()
+    task.wait(Config.ScanDelay)
+    while Config.Running and gui.Parent do
+        setStatus("scan du serveur...", COL.yellow)
+        local found, total = scanServer()
+        if total > 0 then
+            addFound(found)
+            if Config.StopOnFind then
+                Config.Running = false
+                setRunningUI(false)
+                saveState()
+                setStatus("TROUVÉ ! (" .. total .. " objet(s))", COL.green)
+                return
+            end
+        end
+
+        setStatus("recherche d'un serveur...", COL.yellow)
+        local serverId, reason = findServer()
+        if serverId then
+            State.visited[serverId] = true
+            saveState()
+            setStatus("téléportation...", COL.accent)
+            local ok, err = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, LocalPlayer)
+            end)
+            if not ok then
+                warn("[VyreHub] Erreur téléportation : " .. tostring(err))
+                setStatus("échec TP : " .. tostring(err), COL.red)
+            end
+            task.wait(5)
+        else
+            warn("[VyreHub] Pas de serveur : " .. tostring(reason))
+            setStatus(tostring(reason) .. " - nouvel essai...", COL.red)
+            task.wait(5)
+        end
+    end
+end
+
+-- MODE VIEWER : interroge le feed et affiche les nouveaux pets
+local lastSeen = 0
+
+local function matchesTargets(entry)
+    local targets = getTargets()
+    if #targets == 0 then return true end
+    for _, petName in ipairs(entry.pets or {}) do
+        local lname = string.lower(tostring(petName))
+        for _, t in ipairs(targets) do
+            if string.find(lname, t, 1, true) then return true end
+        end
+    end
+    return false
+end
+
+-- Retourne (nouvelles entrées, erreur)
+local function pollFeed()
+    local url = Config.FeedURL .. "/feed?since=" .. tostring(lastSeen)
+    local body, code = httpRequest("GET", url)
+    if not body then return nil, "feed injoignable (HTTP bloqué ou URL fausse)" end
+    if code and code ~= 200 then return nil, "feed HTTP " .. tostring(code) end
+
+    local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok or type(data) ~= "table" then return nil, "réponse du feed invalide" end
+
+    local fresh = {}
+    for _, e in ipairs(data) do
+        if type(e) == "table" and e.jobId and type(e.pets) == "table" then
+            if type(e.time) == "number" and e.time > lastSeen then lastSeen = e.time end
+            if e.placeId == game.PlaceId and matchesTargets(e) then
+                local entry = {
+                    pets = e.pets,
+                    jobId = e.jobId,
+                    players = e.players,
+                    time = math.floor((e.time or 0) / 1000),
+                }
+                upsertEntry(entry)
+                if e.jobId ~= game.JobId and not State.visited[e.jobId] then
+                    table.insert(fresh, entry)
+                end
+            end
+        end
+    end
+    return fresh
+end
+
+local function viewerLoop()
+    if Config.FeedURL == "" then
+        Config.Running = false
+        setRunningUI(false)
+        setStatus("mets l'URL du feed dans Réglages", COL.red)
+        saveState()
+        return
+    end
+    while Config.Running and gui.Parent do
+        local fresh, err = pollFeed()
+        if err then
+            setStatus(err, COL.red)
+        else
+            if #fresh > 0 then
+                renderList()
+                saveState()
+                setStatus(#fresh .. " nouveau(x) pet(s) !", COL.green)
+                if Config.AutoJoin then
+                    local newest = fresh[#fresh]
+                    Config.Running = false
+                    setRunningUI(false)
+                    saveState()
+                    joinServer(newest.jobId)
+                    return
+                end
+            else
+                setStatus("écoute du feed...", COL.yellow)
+            end
+        end
+        task.wait(2)
+    end
+end
+
+local function startLoop()
+    if Config.Mode == "viewer" then
+        task.spawn(viewerLoop)
+    else
+        task.spawn(scannerLoop)
+    end
+end
+
+TeleportService.TeleportInitFailed:Connect(function(_, result)
+    setStatus("échec TP (" .. tostring(result) .. ")", COL.red)
+end)
+
+startBtn.MouseButton1Click:Connect(function()
+    if Config.Running then
+        Config.Running = false
+        setRunningUI(false)
+        setStatus("arrêté")
+        saveState()
+        return
+    end
+    applySettings()
+    Config.Running = true
+    setRunningUI(true)
+    saveState()
+    startLoop()
+end)
+
+-- Relance après téléportation (nécessite ScriptURL, sinon utilise autoexec)
+if ScriptURL ~= "" then
+    local q = queue_on_teleport or (syn and syn.queue_on_teleport)
+    if q then
+        pcall(q, ('loadstring(game:HttpGet("%s"))()'):format(ScriptURL))
+    end
+end
+
+-- Démarrage
+showPage("joiner")
+renderList()
+if resumeRun then
+    Config.Running = true
+    setRunningUI(true)
+    startLoop()
+else
+    setStatus("prêt")
+end
+print("[VyreHub] v3.0 chargé (mode " .. Config.Mode .. ").")
